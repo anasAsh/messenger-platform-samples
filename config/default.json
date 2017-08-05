@@ -1,4 +1,7 @@
 {
+    "redisHost": "localhost",
+    "redisPort": "6379",
+    "redisDatabase" : "0",
     "appSecret": "",
     "pageAccessToken": "",
     "validationToken": "JOSA-is-here",

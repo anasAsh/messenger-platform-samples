@@ -1,7 +1,6 @@
 const request = require('request');
 
-
-module.exports = (text) => {
+module.exports.get = (text) => {
   const options = {
     url: 'https://api.wit.ai/message?v=20170804&q='+encodeURI(text),
     headers: {

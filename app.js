@@ -17,7 +17,9 @@ const
   express = require('express'),
   https = require('https'),
   request = require('request'),
-  wit = require('./wit');
+  wit = require('./wit'),
+  api = require('./api'),
+  redis = require('./redis');
 
 
 var app = express();
@@ -98,23 +100,30 @@ app.post('/webhook', function (req, res) {
       var pageID = pageEntry.id;
       var timeOfEvent = pageEntry.time;
 
+
       // Iterate over each messaging event
       pageEntry.messaging.forEach(function(messagingEvent) {
-        if (messagingEvent.optin) {
-          receivedAuthentication(messagingEvent);
-        } else if (messagingEvent.message) {
-          nlpMessage(messagingEvent);
-        } else if (messagingEvent.delivery) {
-          receivedDeliveryConfirmation(messagingEvent);
-        } else if (messagingEvent.postback) {
-          receivedPostback(messagingEvent);
-        } else if (messagingEvent.read) {
-          receivedMessageRead(messagingEvent);
-        } else if (messagingEvent.account_linking) {
-          receivedAccountLink(messagingEvent);
-        } else {
-          console.log("Webhook received unknown messagingEvent: ", messagingEvent);
-        }
+        redis.getNextIntent(messagingEvent.sender.id)
+          .then((nextIntent) => {
+            console.log('nextIntent', nextIntent);
+            if (nextIntent && nextIntent.type === 'create_image') {
+              sendImageUrl(nextIntent, messagingEvent)
+            } else if (messagingEvent.optin) {
+              receivedAuthentication(messagingEvent);
+            } else if (messagingEvent.message) {
+              nlpMessage(messagingEvent);
+            } else if (messagingEvent.delivery) {
+              receivedDeliveryConfirmation(messagingEvent);
+            } else if (messagingEvent.postback) {
+              receivedPostback(messagingEvent);
+            } else if (messagingEvent.read) {
+              receivedMessageRead(messagingEvent);
+            } else if (messagingEvent.account_linking) {
+              receivedAccountLink(messagingEvent);
+            } else {
+              console.log("Webhook received unknown messagingEvent: ", messagingEvent);
+            }
+          });
       });
     });
   }
@@ -221,19 +230,72 @@ function nlpMessage(event) {
   var senderID = event.sender.id;
   var message = event.message;
 
-  console.log(JSON.stringify(event));
-
-  wit(message.text)
+  wit.get(message.text)
     .then((response) => {
-      console.log('response', JSON.stringify(response));
-      if (response.entities.intent[0].value == 'image_create') {
+      console.log('response', JSON.stringify(response.entities.search_query));
+      if (!response.entities) {
+        sendTextMessage(senderID, 'بأمكانك البحث عن صور اول اشي, مثلا اكتب "بدي صورة تلج"');
+      } else if (response.entities.intent[0].value == 'image_create') {
         console.log('image_create');
-        sendTextMessage(senderID, 'طيب');
+        sendTextMessage(senderID, 'بأمكانك البحث عن صور اول اشي, مثلا اكتب "بدي صورة تلج"');
+      } else if (response.entities.intent[0].value == 'get_started') {
+        console.log('image_create');
+        sendTextMessage(senderID, 'مرحبا, انا صانع القصاصات, اكتبلي عن اي صور بتدور, مثلا اكتب: "بدي صور ثلج"');
+        //sendTextMessage(senderID, 'بأمكانك البحث عن صور اول اشي, مثلا اكتب "بدي صورة تلج"');
+      } else if (response.entities && response.entities.search_query) {
+        api.search(response.entities.search_query[0].value)
+          .then((imagesResult) => {
+            if (imagesResult.result.length) {
+              const elements = createImagesElements(imagesResult.result);
+              sendGenericMessage(senderID, elements);
+            } else {
+              sendTextMessage(senderID, 'مافي...');
+            }
+          });
       } else {
-        receivedMessage(event);
+        console.log('>>>>>!!!!!!!!!!!!!!', response.entities.search_query);
+        sendTextMessage(senderID, 'kk, بأمكانك البحث عن صور اول اشي, مثلا اكتب "بدي صورة تلج"');
+        //receivedMessage(event);
       }
     });
+}
 
+
+
+function createImagesElements(imagesData) {
+  return imagesData.map((image, index) => {
+    return {
+      title: `image #${index}`,
+      subtitle: image.source_photographer_name,
+      // item_url: "https://www.oculus.com/en-us/touch/",
+      image_url: image.resizable_serve_url_template.replace('WIDTH', '400').replace('HEIGHT', '200'),
+      buttons: [{
+        type: "postback",
+        title: "اكتب قصاصة",
+        payload: JSON.stringify({image_url: image.resizable_serve_url_template}),
+      }]
+    };
+  });
+}
+
+function sendImageUrl(data, event) {
+  var senderID = event.sender.id;
+  var recipientID = event.recipient.id;
+  var timeOfMessage = event.timestamp;
+  var message = event.message;
+  const urlData = {
+    "id":"export-1501871730106",
+    "lines":[message.text],
+    "photo":{"url":data.image_url, "sourceName":"Unsplash"},
+    "font":"rsail",
+    "textFill":"p90",
+    "textFit":"fit",
+    "textPos":"mc",
+    "size": {"width":1600,"height":900},
+    "nophoto":false
+  };
+  const url = `https://qosas.at/download?config=${encodeURIComponent(JSON.stringify(urlData))}`;
+  sendButtonMessage(senderID, url);
 }
 
 function receivedMessage(event) {
@@ -377,14 +439,17 @@ function receivedPostback(event) {
 
   // The 'payload' param is a developer-defined field which is set in a postback
   // button for Structured Messages.
-  var payload = event.postback.payload;
+  var payload = JSON.parse(event.postback.payload);
+  if (payload.image_url) {
+    redis.setNextIntent(senderID, {type: 'create_image', image_url: payload.image_url});
+    sendTextMessage(senderID, `اختيار جميل, يرجى كتابة نص القصاصة... مثلا: إذا غامَرْتَ في شَرَفٍ مَرُومِ فَلا تَقنَعْ
+بما دونَ النّجومِ `);
+  } else {
+    // When a postback is called, we'll send a message back to the sender to
+    // let them know it was successful
+    sendTextMessage(senderID, "Postback called");
+  }
 
-  console.log("Received postback for user %d and page %d with payload '%s' " +
-    "at %d", senderID, recipientID, payload, timeOfPostback);
-
-  // When a postback is called, we'll send a message back to the sender to
-  // let them know it was successful
-  sendTextMessage(senderID, "Postback called");
 }
 
 /*
@@ -557,7 +622,8 @@ function sendTextMessage(recipientId, messageText) {
  * Send a button message using the Send API.
  *
  */
-function sendButtonMessage(recipientId) {
+function sendButtonMessage(recipientId, url) {
+  console.log('image url', url);
   var messageData = {
     recipient: {
       id: recipientId
@@ -567,19 +633,11 @@ function sendButtonMessage(recipientId) {
         type: "template",
         payload: {
           template_type: "button",
-          text: "This is test text",
+          text: "تمام...",
           buttons:[{
             type: "web_url",
-            url: "https://www.oculus.com/en-us/rift/",
-            title: "Open Web URL"
-          }, {
-            type: "postback",
-            title: "Trigger Postback",
-            payload: "DEVELOPER_DEFINED_PAYLOAD"
-          }, {
-            type: "phone_number",
-            title: "Call Phone Number",
-            payload: "+16505551234"
+            url: url,
+            title: "افتح الصورة"
           }]
         }
       }
@@ -593,7 +651,8 @@ function sendButtonMessage(recipientId) {
  * Send a Structured Message (Generic Message type) using the Send API.
  *
  */
-function sendGenericMessage(recipientId) {
+function sendGenericMessage(recipientId, elements) {
+  console.log(elements);
   var messageData = {
     recipient: {
       id: recipientId
@@ -603,35 +662,7 @@ function sendGenericMessage(recipientId) {
         type: "template",
         payload: {
           template_type: "generic",
-          elements: [{
-            title: "rift",
-            subtitle: "Next-generation virtual reality",
-            item_url: "https://www.oculus.com/en-us/rift/",
-            image_url: SERVER_URL + "/assets/rift.png",
-            buttons: [{
-              type: "web_url",
-              url: "https://www.oculus.com/en-us/rift/",
-              title: "Open Web URL"
-            }, {
-              type: "postback",
-              title: "Call Postback",
-              payload: "Payload for first bubble",
-            }],
-          }, {
-            title: "touch",
-            subtitle: "Your Hands, Now in VR",
-            item_url: "https://www.oculus.com/en-us/touch/",
-            image_url: SERVER_URL + "/assets/touch.png",
-            buttons: [{
-              type: "web_url",
-              url: "https://www.oculus.com/en-us/touch/",
-              title: "Open Web URL"
-            }, {
-              type: "postback",
-              title: "Call Postback",
-              payload: "Payload for second bubble",
-            }]
-          }]
+          elements: elements
         }
       }
     }
